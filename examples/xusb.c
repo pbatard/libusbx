@@ -47,14 +47,13 @@
 #define false (!true)
 #endif
 
-
 // Future versions of libusbx will use usb_interface instead of interface
 // in libusb_config_descriptor => catter for that
 #define usb_interface interface
 
 // Global variables
 bool binary_dump = false;
-char binary_name[64] = "raw.bin";
+char binary_name[256] = "data.bin";
 
 static int perr(char const *format, ...)
 {
@@ -138,6 +137,8 @@ enum test_type {
 	USE_XBOX,
 	USE_SCSI,
 	USE_HID,
+	USE_FX2,		// Cypress FX2/FX3 code upload
+	USE_FX3,
 } test_mode;
 uint16_t VID, PID;
 
@@ -729,6 +730,149 @@ static void read_ms_winsub_feature_descriptors(libusb_device_handle *handle, uin
 	}
 }
 
+// Set an FX2 device in or out of reset mode, for RAM upload.
+// See chapter 3.8 of the FX2 EZ-USB Technical Reference Manual
+static int fx2_reset(libusb_device_handle *handle, bool set)
+{
+	unsigned char cpucs_data = (set)?0x01:0x00;
+	int status = 0;
+
+	// Set the CPU in or out of reset mode to upload data to RAM
+	printf("Putting FX2 %s reset mode\n", (set)?"in":"out of");
+	status = libusb_control_transfer(handle,
+		LIBUSB_ENDPOINT_OUT|LIBUSB_REQUEST_TYPE_VENDOR|LIBUSB_RECIPIENT_DEVICE,
+		0xA0,                // bRequest: Vendor (Cypress)
+		0xE600,              // wValue (LSW)
+		0x0000,              // wIndex (MSW) => CPUCS register at 0xE600
+		&cpucs_data,         // data
+		1,                   // wLength
+		1000);               // timeout in ms
+	if (status < 0) {
+		perr("  Failed: %s\n", libusb_error_name(status));
+		return 1;
+	}
+	return 0;
+}
+
+// Upload 8051 (BIX format) or ARM (IMG format) code to the RAM of a Cypress FX2/FX3 device in bootloader mode
+static int upload_to_fx_ram(libusb_device_handle *handle, char* path, bool fx3_mode)
+{
+	unsigned char header[4];
+	unsigned char data[4096];
+	const uint32_t RETRY_LIMIT = 5;
+	FILE *fw;
+	int status = 0;
+	uint32_t retry;
+	uint32_t segment_addr = 0, cur_addr = 0;
+	uint32_t segment_len = sizeof(data), bytes_remaining, bytes_this_chunk;
+
+	printf("\nUploading firmware to FX2 device's RAM:\n");
+
+	fw = fopen(path, "rb");
+	if ( fw == NULL) {
+		perr("  Failed to open %s: %s\n", path, strerror(errno));
+		return -1;
+	}
+
+	if (fx3_mode) {
+		// Validate the header
+		if (!fread(header, sizeof(char), sizeof(header), fw))
+			return -1;
+
+		if ((header[0] != 'C') || (header[1] != 'Y')) {
+			perr("  Invalid file: missing CYpress signature\n");
+			return -1;
+		}
+
+		if (header[3] != 0xB0) {
+			perr("  Invalid file: format 0x%02X, expected 0xB0\n", header[3]);
+			return -1;
+		}
+	} else {
+		// Set the CPU in reset mode to upload data to RAM
+		if (fx2_reset(handle, true))
+			return 1;
+		(void) header;
+	}
+
+	// Now process the data segments
+	do {
+		if (fx3_mode) {
+			if (!fread(&segment_len, sizeof(segment_len), 1, fw))
+				break;
+
+			if (!fread(&segment_addr, sizeof(segment_len), 1, fw))
+				break;
+			segment_len     = segment_len << 2;
+			cur_addr        = segment_addr;
+		}
+		bytes_remaining = segment_len;
+
+		// Make sure we run one time after segment_len == 0,
+		// as FX3 interprets this as a "run from address" command
+		// Because segment_len is never zero, this does not apply for FX2
+		if (segment_len == 0) {
+			printf("\nResetting device to load new firmware image:\n");
+		}
+
+		do {
+			bytes_this_chunk = bytes_remaining;
+			memset(data, 0, sizeof(data));
+			
+			if (bytes_this_chunk > sizeof(data))
+				bytes_this_chunk = sizeof(data);
+
+			if (bytes_this_chunk && !fread(data, sizeof(char), bytes_this_chunk, fw))
+				break;
+
+			printf ("Writing %4d (0x%04x) bytes to address 0x%08x\n", bytes_this_chunk, bytes_this_chunk, cur_addr);
+
+			// Issue the control request. For more information, see also
+			// FX3 programmers manual, p. 131
+			// http://www.cypress.com/?app=forum&id=167&rID=54054
+			// http://www.cypress.com/?app=forum&id=167&rID=53996
+			status = LIBUSB_ERROR_TIMEOUT;
+			retry = 0;
+			do {
+				status = libusb_control_transfer(handle,
+					LIBUSB_ENDPOINT_OUT|LIBUSB_REQUEST_TYPE_VENDOR|LIBUSB_RECIPIENT_DEVICE,
+					0xA0,                       // bRequest: Vendor (Cypress)
+					cur_addr & 0xFFFF,          // wValue (address LSW)
+					cur_addr >> 16,             // wIndex (address MSW)
+					data,                       // data
+					(uint16_t)bytes_this_chunk, // wLength
+					1000);                      // timeout in ms
+			} while ((status == LIBUSB_ERROR_TIMEOUT) && (retry++ <= RETRY_LIMIT));
+
+			if (status != bytes_this_chunk) {
+				// For FX3, libusbx will return an I/O error after upload, and the device disappears instantly
+				if ((status == LIBUSB_ERROR_IO) && (segment_len == 0))
+					perr("  Device reset successfully accomplished\n");
+				else if (status < 0)
+					perr("  Write error: %s\n", libusb_error_name(status));
+				else
+					perr("  Write error: Only %d of %d bytes transmitted\n", status, bytes_this_chunk);
+			}
+
+			cur_addr        += bytes_this_chunk;
+			bytes_remaining -= bytes_this_chunk;
+
+		} while ((status >= 0) && (bytes_remaining > 0));
+
+		if ((segment_len == 0) || (feof(fw)))
+			break;
+
+	} while (status >= 0);
+
+	if (!fx3_mode) {
+		// Bring the CPU out of reset (FX2)
+		if (fx2_reset(handle, false))
+			return 1;
+	}
+
+	return 0;
+}
+
 static int test_device(uint16_t vid, uint16_t pid)
 {
 	libusb_device_handle *handle;
@@ -878,6 +1022,10 @@ static int test_device(uint16_t vid, uint16_t pid)
 	case USE_HID:
 		test_hid(handle, endpoint_in);
 		break;
+	case USE_FX2:
+	case USE_FX3:
+		CALL_CHECK(upload_to_fx_ram(handle, binary_name, (test_mode == USE_FX3)));
+		break;
 	case USE_SCSI:
 		CALL_CHECK(test_mass_storage(handle, endpoint_in, endpoint_out));
 	case USE_GENERIC:
@@ -933,7 +1081,20 @@ int main(int argc, char** argv)
 				case 'd':
 					debug_mode = true;
 					break;
+				case 'f':
+					test_mode = USE_FX2;
+					// Fall through
+				case 'g':
+					if (!VID && !PID) {
+						// Cypress FX2/FX3 DVK VID/PID
+						VID = 0x04B4;
+						PID = (test_mode == USE_FX2)?0x8613:0x0053;
+					}
+					if (test_mode != USE_FX2)
+						test_mode = USE_FX3;
+					// Fall through
 				case 'b':
+					binary_dump = true;	// doesn't matter for FX2/FX3
 					if (j+1 < argc) {
 						// WDK's OACR doesn't like strncpy...
 						for (i=0; (i<(sizeof(binary_name)-1)) && (argv[j+1][i] != 0); i++)
@@ -941,9 +1102,8 @@ int main(int argc, char** argv)
 						binary_name[i] = 0;
 						j++;
 					}
-					binary_dump = true;
 					break;
-				case 'g':
+				case 't':
 					break;
 				case 'j':
 					// OLIMEX ARM-USB-TINY JTAG, 2 channel composite device - 2 interfaces
@@ -1002,16 +1162,18 @@ int main(int argc, char** argv)
 	}
 
 	if ((show_help) || (argc == 1) || (argc > 7)) {
-		printf("usage: %s [-d] [-b [file]] [-h] [-i] [-j] [-k] [-x] [vid:pid]\n", argv[0]);
+		printf("usage: %s [-d] [-b [file]] [-{f|g} [file]] [-h] [-i] [-j] [-k] [-x] [vid:pid]\n", argv[0]);
 		printf("   -h: display usage\n");
 		printf("   -d: enable debug output (if library was compiled with debug enabled)\n");
-		printf("   -b: dump Mass Storage first block to binary file\n");
-		printf("   -g: short generic test (default)\n");
-		printf("   -k: test generic Mass Storage USB device (using WinUSB)\n");
-		printf("   -j: test FTDI based JTAG device (using WinUSB)\n");
-		printf("   -p: test Sony PS3 SixAxis controller (using WinUSB)\n");
-		printf("   -s: test Microsoft Sidewinder Precision Pro (using HID)\n");
-		printf("   -x: test Microsoft XBox Controller Type S (using WinUSB)\n");
+		printf("   -b: dump Mass Storage first block to binary file (default='data.bin')\n");
+		printf("   -f: upload firmware to Cypress FX2 RAM (default='data.bin')\n");
+		printf("   -g: upload firmware to Cypress FX3 RAM (default='data.bin')\n");
+		printf("   -k: test generic Mass Storage USB device\n");
+		printf("   -j: test FTDI based JTAG device\n");
+		printf("   -p: test Sony PS3 SixAxis controller\n");
+		printf("   -s: test Microsoft Sidewinder Precision Pro\n");
+		printf("   -x: test Microsoft XBox Controller\n");
+		printf("   -t: short generic test (default)\n");
 		return 0;
 	}
 

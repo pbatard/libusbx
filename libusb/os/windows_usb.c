@@ -291,17 +291,19 @@ static bool get_devinfo_data(struct libusb_context *ctx,
  * dev_info_data: a pointer to an SP_DEVINFO_DATA to be filled (or NULL if not needed)
  * guid: the GUID for which to retrieve interface details
  * index: zero based index of the interface in the device info list
+ * filter_path: if non NULL, receives the filter path string
  *
  * Note: it is the responsibility of the caller to free the DEVICE_INTERFACE_DETAIL_DATA
  * structure returned and call this function repeatedly using the same guid (with an
  * incremented index starting at zero) until all interfaces have been returned.
  */
 static SP_DEVICE_INTERFACE_DETAIL_DATA_A *get_interface_details(struct libusb_context *ctx,
-	HDEVINFO *dev_info, SP_DEVINFO_DATA *dev_info_data, const GUID* guid, unsigned _index)
+	HDEVINFO *dev_info, SP_DEVINFO_DATA *dev_info_data, const GUID* guid, unsigned _index, char** filter_path)
 {
 	SP_DEVICE_INTERFACE_DATA dev_interface_data;
 	SP_DEVICE_INTERFACE_DETAIL_DATA_A *dev_interface_details = NULL;
-	DWORD size;
+	HKEY hkey_device_interface;
+	DWORD size, value_length, value_type, libusb0_symboliclink_index;
 
 	if (_index <= 0) {
 		*dev_info = pSetupDiGetClassDevsA(guid, NULL, NULL, DIGCF_PRESENT|DIGCF_DEVICEINTERFACE);
@@ -344,7 +346,8 @@ static SP_DEVICE_INTERFACE_DETAIL_DATA_A *get_interface_details(struct libusb_co
 		goto err_exit;
 	}
 
-	if ((dev_interface_details = (SP_DEVICE_INTERFACE_DETAIL_DATA_A*) calloc(size, 1)) == NULL) {
+	dev_interface_details = (SP_DEVICE_INTERFACE_DETAIL_DATA_A*) calloc(size, 1);
+	if (dev_interface_details == NULL) {
 		usbi_err(ctx, "could not allocate interface data for index %u.", _index);
 		goto err_exit;
 	}
@@ -354,6 +357,27 @@ static SP_DEVICE_INTERFACE_DETAIL_DATA_A *get_interface_details(struct libusb_co
 		dev_interface_details, size, &size, NULL)) {
 		usbi_err(ctx, "could not access interface data (actual) for index %u: %s",
 			_index, windows_error_str(0));
+	}
+
+	// Lookup the libusb0 symbolic index if requested
+	if (filter_path != NULL) {
+		hkey_device_interface = pSetupDiOpenDeviceInterfaceRegKey(*dev_info, &dev_interface_data, 0, KEY_READ);
+		if (hkey_device_interface != INVALID_HANDLE_VALUE) {
+			value_type = REG_NONE;
+			value_length = sizeof(DWORD);
+			if (pRegQueryValueExW(hkey_device_interface, L"LUsb0", NULL, &value_type,
+				(LPBYTE) &libusb0_symboliclink_index, &value_length) == ERROR_SUCCESS) {
+				if (libusb0_symboliclink_index < 256) {
+					// libusb0.sys is connected to this device instance
+					// If the the device interface guid is {F9F3FF14-AE21-48A0-8A25-8011A7A931D9} then it's a filter
+					safe_sprintf(*filter_path, sizeof("\\\\.\\libusb0-0000"), "\\\\.\\libusb0-%04d", libusb0_symboliclink_index);
+					usbi_info(ctx,"assigned libusb0 symbolic link %s", *filter_path);
+				} else {
+					// libusb0.sys was connected to this device instance at one time; but not anymore
+				}
+			}
+			pRegCloseKey(hkey_device_interface);
+		}
 	}
 
 	return dev_interface_details;
@@ -363,88 +387,6 @@ err_exit:
 	*dev_info = INVALID_HANDLE_VALUE;
 	return NULL;
 }
-
-/* For libusb0 filter */
-SP_DEVICE_INTERFACE_DETAIL_DATA_A *get_interface_details_filter(struct libusb_context *ctx,
-	HDEVINFO *dev_info, SP_DEVINFO_DATA *dev_info_data, const GUID* guid, unsigned _index, char* filter_path){
-	SP_DEVICE_INTERFACE_DATA dev_interface_data;
-	SP_DEVICE_INTERFACE_DETAIL_DATA_A *dev_interface_details = NULL;
-	DWORD size;
-	if (_index <= 0) {
-		*dev_info = pSetupDiGetClassDevsA(guid, NULL, NULL, DIGCF_PRESENT|DIGCF_DEVICEINTERFACE);
-	}
-	if (dev_info_data != NULL) {
-		dev_info_data->cbSize = sizeof(SP_DEVINFO_DATA);
-		if (!pSetupDiEnumDeviceInfo(*dev_info, _index, dev_info_data)) {
-			if (GetLastError() != ERROR_NO_MORE_ITEMS) {
-				usbi_err(ctx, "Could not obtain device info data for index %u: %s",
-					_index, windows_error_str(0));
-			}
-			pSetupDiDestroyDeviceInfoList(*dev_info);
-			*dev_info = INVALID_HANDLE_VALUE;
-			return NULL;
-		}
-	}
-	dev_interface_data.cbSize = sizeof(SP_DEVICE_INTERFACE_DATA);
-	if (!pSetupDiEnumDeviceInterfaces(*dev_info, NULL, guid, _index, &dev_interface_data)) {
-		if (GetLastError() != ERROR_NO_MORE_ITEMS) {
-			usbi_err(ctx, "Could not obtain interface data for index %u: %s",
-				_index, windows_error_str(0));
-		}
-		pSetupDiDestroyDeviceInfoList(*dev_info);
-		*dev_info = INVALID_HANDLE_VALUE;
-		return NULL;
-	}
-	// Read interface data (dummy + actual) to access the device path
-	if (!pSetupDiGetDeviceInterfaceDetailA(*dev_info, &dev_interface_data, NULL, 0, &size, NULL)) {
-		// The dummy call should fail with ERROR_INSUFFICIENT_BUFFER
-		if (GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
-			usbi_err(ctx, "could not access interface data (dummy) for index %u: %s",
-				_index, windows_error_str(0));
-			goto err_exit;
-		}
-	} else {
-		usbi_err(ctx, "program assertion failed - http://msdn.microsoft.com/en-us/library/ms792901.aspx is wrong.");
-		goto err_exit;
-	}
-	if ((dev_interface_details = malloc(size)) == NULL) {
-		usbi_err(ctx, "could not allocate interface data for index %u.", _index);
-		goto err_exit;
-	}
-	dev_interface_details->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_A);
-	if (!pSetupDiGetDeviceInterfaceDetailA(*dev_info, &dev_interface_data,
-		dev_interface_details, size, &size, NULL)) {
-		usbi_err(ctx, "could not access interface data (actual) for index %u: %s",
-			_index, windows_error_str(0));
-	}
-	// [trobinso] lookup the libusb0 symbolic index.
-	if (dev_interface_details) {
-		HKEY hkey_device_interface=pSetupDiOpenDeviceInterfaceRegKey(*dev_info,&dev_interface_data,0,KEY_READ);
-		if (hkey_device_interface != INVALID_HANDLE_VALUE) {
-			DWORD libusb0_symboliclink_index=0;
-			DWORD value_length=sizeof(DWORD);
-			DWORD value_type=0;
-			LONG status;
-			status = pRegQueryValueExW(hkey_device_interface, L"LUsb0", NULL, &value_type,
-				(LPBYTE) &libusb0_symboliclink_index, &value_length);
-			if (status == ERROR_SUCCESS) {
-				if (libusb0_symboliclink_index < 256) {
-					// libusb0.sys is connected to this device instance.
-					// If the the device interface guid is {F9F3FF14-AE21-48A0-8A25-8011A7A931D9} then it's a filter.
-					safe_sprintf(filter_path, sizeof("\\\\.\\libusb0-0000"), "\\\\.\\libusb0-%04d", libusb0_symboliclink_index);
-					usbi_info(ctx,"assigned libusb0 symbolic link %s", filter_path);
-				} else {
-					// libusb0.sys was connected to this device instance at one time; but not anymore.
-				}
-			}
-			pRegCloseKey(hkey_device_interface);
-		}
-	}
-	return dev_interface_details;
-err_exit:
-	pSetupDiDestroyDeviceInfoList(*dev_info);
-	*dev_info = INVALID_HANDLE_VALUE;
-	return NULL;}
 
 /* Hash table functions - modified From glibc 2.3.2:
    [Aho,Sethi,Ullman] Compilers: Principles, Techniques and Tools, 1986
@@ -1415,7 +1357,7 @@ static int windows_get_device_list(struct libusb_context *ctx, struct discovered
 			}
 			if (pass != GEN_PASS) {
 				// Except for GEN, all passes deal with device interfaces
-				dev_interface_details = get_interface_details(ctx, &dev_info, &dev_info_data, guid[pass], i);
+				dev_interface_details = get_interface_details(ctx, &dev_info, &dev_info_data, guid[pass], i, NULL);
 				if (dev_interface_details == NULL) {
 					break;
 				} else {
@@ -2684,7 +2626,7 @@ static int winusbx_claim_interface(int sub_api, struct libusb_device_handle *dev
 	HDEVINFO dev_info;
 	SP_DEVINFO_DATA dev_info_data;
 	char* dev_path_no_guid = NULL;
-	char filter_path[] = "\\\\.\\libusb0-0000";
+	char* filter_path = "\\\\.\\libusb0-0000";
 	bool found_filter = false;
 
 	CHECK_WINUSBX_AVAILABLE(sub_api);
@@ -2708,11 +2650,11 @@ static int winusbx_claim_interface(int sub_api, struct libusb_device_handle *dev
 				return LIBUSB_ERROR_NO_DEVICE;
 			default:
 				// it may be that we're using the libusb0 filter driver.
-				// [TODO] can we move this whole business into the K/0 DLL?
+				// TODO: can we move this whole business into the K DLL?
 				for (i = 0; ; i++) {
 					safe_free(dev_interface_details);
 					safe_free(dev_path_no_guid);
-					dev_interface_details = get_interface_details_filter(ctx, &dev_info, &dev_info_data, &GUID_DEVINTERFACE_LIBUSB0_FILTER, i, filter_path);
+					dev_interface_details = get_interface_details(ctx, &dev_info, &dev_info_data, &GUID_DEVINTERFACE_LIBUSB0_FILTER, i, &filter_path);
 					if ((found_filter) || (dev_interface_details == NULL)) {
 						break;
 					}

@@ -37,6 +37,42 @@
 #endif
 #endif
 
+#define FX_TYPE_UNDEFINED  -1
+#define FX_TYPE_AN21       0	/* Original AnchorChips parts */
+#define FX_TYPE_FX1        1	/* Updated Cypress versions */
+#define FX_TYPE_FX2        2	/* USB 2.0 versions */
+#define FX_TYPE_FX2LP      3	/* Updated FX2 */
+#define FX_TYPE_FX3        4	/* USB 3.0 versions */
+#define FX_TYPE_MAX        5
+
+#define FX_TYPE_NAMES      { "an21", "fx", "fx2", "fx2lp", "fx3" }
+
+/* 
+ * Automatically identified devices (VID, PID, type, designation).
+ * TODO: Could use some validation. Also where's the FX2?
+ */
+typedef struct {
+	uint16_t vid;
+	uint16_t pid;
+	int type;
+	const char* designation;
+} fx_known_device;
+
+#define FX_KNOWN_DEVICES { \
+	{ 0x0547, 0x2122, FX_TYPE_AN21, "Cypress EZ-USB (2122S)" },\
+	{ 0x0547, 0x2125, FX_TYPE_AN21, "Cypress EZ-USB (2121S/2125S)" },\
+	{ 0x0547, 0x2126, FX_TYPE_AN21, "Cypress EZ-USB (2126S)" },\
+	{ 0x0547, 0x2131, FX_TYPE_AN21, "Cypress EZ-USB (2131Q/2131S/2135S)" },\
+	{ 0x0547, 0x2136, FX_TYPE_AN21, "Cypress EZ-USB (2136S)" },\
+	{ 0x0547, 0x2225, FX_TYPE_AN21, "Cypress EZ-USB (2225)" },\
+	{ 0x0547, 0x2226, FX_TYPE_AN21, "Cypress EZ-USB (2226)" },\
+	{ 0x0547, 0x2235, FX_TYPE_AN21, "Cypress EZ-USB (2235)" },\
+	{ 0x0547, 0x2236, FX_TYPE_AN21, "Cypress EZ-USB (2236)" },\
+	{ 0x04b4, 0x6473, FX_TYPE_FX1, "Cypress EZ-USB FX1" },\
+	{ 0x04b4, 0x8613, FX_TYPE_FX2LP, "Cypress EZ-USB FX2LP (68013A/68014A/68015A/68016A)" }, \
+	{ 0x04b4, 0x00f3, FX_TYPE_FX3, "Cypress EZ-USB FX3 (3014)" }, \
+}
+
 /*
  * This function loads the firmware from the given file into RAM.
  * The file is assumed to be in Intel HEX format.  If fx2 is set, uses
@@ -47,7 +83,7 @@
  * The target processor is reset at the end of this download.
  */
 extern int ezusb_load_ram(libusb_device_handle *device,
-	const char *path, int fx2, int stage);
+	const char *path, int fx_type, int stage);
 
 /*
  * This function stores the firmware from the given file into EEPROM.
@@ -61,7 +97,7 @@ extern int ezusb_load_ram(libusb_device_handle *device,
  * how to respond to the EEPROM write request.
  */
 extern int ezusb_load_eeprom(libusb_device_handle *device,
-	const char *path, const char *type, int config);
+	const char *path, int fx_type, int config);
 
 /* boolean flag, says whether to write extra messages to stderr */
 extern int verbose;

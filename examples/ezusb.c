@@ -109,6 +109,16 @@ static bool fx2lp_is_external(uint32_t addr, size_t len)
 		return true;
 }
 
+/*
+ * return true if [addr,addr+len] includes external RAM
+ * for Cypress EZ-USB FX3
+ */
+static bool fx3_is_external(uint32_t addr, size_t len)
+{
+	// TODO
+	return false;
+}
+
 /*****************************************************************************/
 
 /*
@@ -450,7 +460,7 @@ static int ram_poke(void *context, uint32_t addr, bool external,
  * memory is written, expecting a second stage loader to have already
  * been loaded.  Then file is re-parsed and on-chip memory is written.
  */
-int ezusb_load_ram(libusb_device_handle *device, const char *path, int fx2, int stage)
+int ezusb_load_ram(libusb_device_handle *device, const char *path, int fx_type, int stage)
 {
 	FILE *image;
 	uint32_t cpucs_addr;
@@ -466,12 +476,16 @@ int ezusb_load_ram(libusb_device_handle *device, const char *path, int fx2, int 
 		logerror("open RAM hexfile image %s\n", path);
 
 	/* EZ-USB original/FX and FX2 devices differ, apart from the 8051 core */
-	if (fx2 == 2) {
+	if (fx_type == FX_TYPE_FX2LP) {
 		cpucs_addr = 0xe600;
 		is_external = fx2lp_is_external;
-	} else if (fx2) {
+	} else if (fx_type == FX_TYPE_FX2) {
 		cpucs_addr = 0xe600;
 		is_external = fx2_is_external;
+	} else if (fx_type == FX_TYPE_FX3) {
+		// TODO
+		cpucs_addr = 0;
+		is_external = fx3_is_external;
 	} else {
 		cpucs_addr = 0x7f92;
 		is_external = fx_is_external;
@@ -491,7 +505,7 @@ int ezusb_load_ram(libusb_device_handle *device, const char *path, int fx2, int 
 
 		/* let CPU run; overwrite the 2nd stage loader later */
 		if (verbose)
-			logerror("2nd stage:  write external memory\n");
+			logerror("2nd stage: write external memory\n");
 	}
 
 	/* scan the image, first (maybe only) time */
@@ -514,7 +528,7 @@ int ezusb_load_ram(libusb_device_handle *device, const char *path, int fx2, int 
 		/* at least write the interrupt vectors (at 0x0000) for reset! */
 		rewind(image);
 		if (verbose)
-			logerror("2nd stage:  write on-chip memory\n");
+			logerror("2nd stage: write on-chip memory\n");
 		status = parse_ihex(image, &ctx, is_external, ram_poke);
 		if (status < 0) {
 			logerror("unable to completely download %s\n", path);
@@ -563,7 +577,7 @@ static int eeprom_poke(void *context, uint32_t addr, bool external,
 		return -EDOM;
 	}
 
-	/* NOTE:  No retries here.  They don't seem to be needed;
+	/* NOTE: No retries here.  They don't seem to be needed;
 	 * could be added if that changes.
 	 */
 
@@ -594,13 +608,13 @@ static int eeprom_poke(void *context, uint32_t addr, bool external,
 /*
  * Load an Intel HEX file into target (large) EEPROM, set up to boot from
  * that EEPROM using the specified microcontroller-specific config byte.
- * (Defaults:  FX2 0x08, FX 0x00, AN21xx n/a)
+ * (Defaults: FX2 0x08, FX 0x00, AN21xx n/a)
  *
  * Caller must have pre-loaded a second stage loader that knows how
  * to handle the EEPROM write requests.
  */
 int ezusb_load_eeprom(libusb_device_handle *device, const char *path,
-	const char *type, int config)
+	int fx_type, int config)
 {
 	FILE *image;
 	uint32_t cpucs_addr;
@@ -622,61 +636,70 @@ int ezusb_load_eeprom(libusb_device_handle *device, const char *path,
 		logerror("open EEPROM hexfile image %s\n", path);
 
 	if (verbose)
-		logerror("2nd stage:  write boot EEPROM\n");
+		logerror("2nd stage: write boot EEPROM\n");
 
-	/* EZ-USB family devices differ, apart from the 8051 core */
-	if (strcmp("fx2", type) == 0) {
+	switch(fx_type) {
+	case FX_TYPE_FX2:
 		first_byte = 0xC2;
 		cpucs_addr = 0xe600;
 		is_external = fx2_is_external;
 		ctx.ee_addr = 8;
 		config &= 0x4f;
 		logerror(
-			"FX2:  config = 0x%02x, %sconnected, I2C = %d KHz\n",
+			"FX2: config = 0x%02x, %sconnected, I2C = %d KHz\n",
 			config,
 			(config & 0x40) ? "dis" : "",
-			/* NOTE:  old chiprevs let CPU clock speed be set
+			/* NOTE: old chiprevs let CPU clock speed be set
 			 * or cycle inverted here.  You shouldn't use those.
 			 * (Silicon revs B, C?  Rev E is nice!) */
 			(config & 0x01) ? 400 : 100
 			);
+		break;
 
-	} else if (strcmp("fx2lp", type) == 0) {
+	case FX_TYPE_FX2LP:
 		first_byte = 0xC2;
 		cpucs_addr = 0xe600;
 		is_external = fx2lp_is_external;
 		ctx.ee_addr = 8;
 		config &= 0x4f;
 		fprintf(stderr,
-			"FX2LP:  config = 0x%02x, %sconnected, I2C = %d KHz\n",
+			"FX2LP: config = 0x%02x, %sconnected, I2C = %d KHz\n",
 			config,
 			(config & 0x40) ? "dis" : "",
 			(config & 0x01) ? 400 : 100
 			);
-	} else if(strcmp("fx", type) == 0) {
+		break;
+
+	case FX_TYPE_FX1:
 		first_byte = 0xB6;
 		cpucs_addr = 0x7f92;
 		is_external = fx_is_external;
 		ctx.ee_addr = 9;
 		config &= 0x07;
 		logerror(
-			"FX:  config = 0x%02x, %d MHz%s, I2C = %d KHz\n",
+			"FX: config = 0x%02x, %d MHz%s, I2C = %d KHz\n",
 			config,
 			((config & 0x04) ? 48 : 24),
 			(config & 0x02) ? " inverted" : "",
 			(config & 0x01) ? 400 : 100
 			);
+		break;
 
-	} else if(strcmp("an21", type) == 0) {
+	case FX_TYPE_AN21:
 		first_byte = 0xB2;
 		cpucs_addr = 0x7f92;
 		is_external = fx_is_external;
 		ctx.ee_addr = 7;
 		config = 0;
-		logerror("AN21xx:  no EEPROM config byte\n");
+		logerror("AN21xx: no EEPROM config byte\n");
+		break;
 
-	} else {
-		logerror("?? Unrecognized microcontroller type %s ??\n", type);
+	case FX_TYPE_FX3:
+		// TODO
+		break;
+
+	default:
+		logerror("?? Unrecognized microcontroller type %d ??\n", fx_type);
 		return -1;
 	}
 
@@ -699,16 +722,18 @@ int ezusb_load_eeprom(libusb_device_handle *device, const char *path,
 	}
 
 	/* append a reset command */
-	value = 0;
-	ctx.last = 1;
-	status = eeprom_poke (&ctx, cpucs_addr, 0, &value, sizeof(value));
-	if (status < 0) {
-		logerror("unable to append reset to EEPROM %s\n", path);
-		return status;
+	if (fx_type != FX_TYPE_FX3) {
+		value = 0;
+		ctx.last = 1;
+		status = eeprom_poke (&ctx, cpucs_addr, 0, &value, sizeof(value));
+		if (status < 0) {
+			logerror("unable to append reset to EEPROM %s\n", path);
+			return status;
+		}
 	}
 
 	/* write the config byte for FX, FX2 */
-	if (strcmp("an21", type) != 0) {
+	if ((fx_type != FX_TYPE_AN21) && (fx_type != FX_TYPE_FX3)) {
 		value = (uint8_t)config;
 		status = ezusb_write(device, "write config byte",
 			RW_EEPROM, 7, &value, sizeof(value));
@@ -717,7 +742,7 @@ int ezusb_load_eeprom(libusb_device_handle *device, const char *path,
 	}
 
 	/* EZ-USB FX has a reserved byte */
-	if (strcmp("fx", type) == 0) {
+	if ((fx_type != FX_TYPE_FX1)) {
 		value = 0;
 		status = ezusb_write(device, "write reserved byte",
 			RW_EEPROM, 8, &value, sizeof(value));
@@ -726,14 +751,15 @@ int ezusb_load_eeprom(libusb_device_handle *device, const char *path,
 	}
 
 	/* make the EEPROM say to boot from this EEPROM */
+	// TODO: does this apply for FX3?
 	status = ezusb_write(device, "write EEPROM type byte",
 		RW_EEPROM, 0, &first_byte, sizeof(first_byte));
 	if (status < 0)
 		return status;
 
-	/* Note:  VID/PID/version aren't written.  They should be
-	* written if the EEPROM type is modified (to B4 or C0).
-	*/
+	/* Note: VID/PID/version aren't written.  They should be
+	 * written if the EEPROM type is modified (to B4 or C0).
+	 */
 
 	return 0;
 }

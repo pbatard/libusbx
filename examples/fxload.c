@@ -45,8 +45,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
-#include <errno.h>
 #include <stdarg.h>
+#include <sys/types.h>
 #include <getopt.h>
 
 #include <libusb.h>
@@ -59,6 +59,10 @@ static bool dosyslog = false;
 
 #ifndef FXLOAD_VERSION
 #define FXLOAD_VERSION (__DATE__ " (development)")
+#endif
+
+#ifndef ARRAYSIZE
+#define ARRAYSIZE(A) (sizeof(A)/sizeof((A)[0]))
 #endif
 
 void logerror(const char *format, ...)
@@ -81,24 +85,27 @@ void logerror(const char *format, ...)
 
 int main(int argc, char*argv[])
 {
-	const char *ihex_path = 0;
-	const char *device_path = getenv("DEVICE");
-	const char *type = 0;
-	const char *stage1 = 0;
-	int opt, status, fx2;
-	int config = -1;
+	fx_known_device known_device[] = FX_KNOWN_DEVICES;
+	const char *firmware_path = NULL, *loader_path = NULL;
+	const char *device_id = getenv("DEVICE");
+	const char *type = NULL;
+	const char *fx_name[FX_TYPE_MAX] = FX_TYPE_NAMES;
+	int opt, status, fx_type = FX_TYPE_UNDEFINED;
+	int i, j, config = -1;
 	unsigned vid = 0, pid = 0;
+	libusb_device *dev, **devs;
 	libusb_device_handle *device = NULL;
+	struct libusb_device_descriptor desc;
 
 	while ((opt = getopt(argc, argv, "vV?D:I:c:s:t:")) != EOF)
 		switch (opt) {
 
 		case 'D':
-			device_path = optarg;
+			device_id = optarg;
 			break;
 
 		case 'I':
-			ihex_path = optarg;
+			firmware_path = optarg;
 			break;
 
 		case 'V':
@@ -114,18 +121,10 @@ int main(int argc, char*argv[])
 			break;
 
 		case 's':
-			stage1 = optarg;
+			loader_path = optarg;
 			break;
 
 		case 't':
-			if (strcmp(optarg, "an21")		/* original AnchorChips parts */
-				&& strcmp(optarg, "fx")		/*  updated Cypress versions */
-				&& strcmp(optarg, "fx2")	/* Cypress USB 2.0 versions */
-				&& strcmp(optarg, "fx2lp")	/* updated FX2 */
-				) {
-					logerror("illegal microcontroller type: %s\n", optarg);
-					goto usage;
-			}
 			type = optarg;
 			break;
 
@@ -141,52 +140,116 @@ int main(int argc, char*argv[])
 
 	if (config >= 0) {
 		if (type == 0) {
-			logerror("must specify microcontroller type %s",
-				"to write EEPROM!\n");
+			logerror("must specify microcontroller type to write EEPROM!\n");
 			goto usage;
 		}
-		if (!stage1 || !ihex_path) {
-			logerror("need 2nd stage loader and firmware %s",
-				"to write EEPROM!\n");
+		if (!loader_path || !firmware_path) {
+			logerror("need 2nd stage loader and firmware to write EEPROM!\n");
 			goto usage;
 		}
 	}
 
-	if ((!device_path) || (!ihex_path)) {
-		logerror("no %s specified!\n", (!device_path)?"device":"firmware");
+	if (firmware_path == NULL) {
+		logerror("no firmware specified!\n");
 usage:
-		fputs("usage: ", stderr);
-		fputs(argv[0], stderr);
-		fputs(" [-vV] [-t type] [-D devpath]\n", stderr);
-		fputs("\t\t[-I firmware_hexfile] ", stderr);
-		fputs("[-s loader] [-c config_byte]\n", stderr);
-		fputs("... [-D vid:pid] overrides DEVICE= in env\n", stderr);
-		fputs("... device types:  one of an21, fx, fx2, fx2lp\n", stderr);
+		fprintf(stderr, "\nusage: %s [-vV] [-t type] [-D vid:pid] -I firmware\n", argv[0]);
+		fprintf(stderr, "      [-s loader] [-c config_byte]\n");
+		fprintf(stderr, "      type: one of an21, fx, fx2, fx2lp, fx3\n");
 		return -1;
 	}
 
-	if (sscanf(device_path, "%x:%x" , &vid, &pid) != 2 ) {
+	if ((device_id != NULL) && (sscanf(device_id, "%x:%x" , &vid, &pid) != 2 )) {
 		fputs ("please specify VID & PID as \"vid:pid\" in hexadecimal format\n", stderr);
 		return -1;
 	}
 
+	/* determine the target type */
+	if (type != NULL) {
+		for (i=0; i<FX_TYPE_MAX; i++) {
+			if (strcmp(type, fx_name[i]) == 0) {
+				fx_type = i;
+				break;
+			}
+		}
+		if (i >= FX_TYPE_MAX) {
+			logerror("illegal microcontroller type: %s\n", type);
+			goto usage;
+		}
+	}
+
+	/* open the device using libusbx */
 	status = libusb_init(NULL);
 	if (status < 0) {
 		logerror("libusb_init() failed: %s\n", libusb_error_name(status));
 		return -1;
 	}
 	libusb_set_debug(NULL, verbose);
-	device = libusb_open_device_with_vid_pid(NULL, (uint16_t)vid, (uint16_t)pid);
-	if (device == NULL) {
-		logerror("libusb_open_device() failed\n");
-		libusb_exit(NULL);
-		return -1;
+
+	/* try to pick up missing parameters from known devices */
+	if ((type == NULL) || (device_id == NULL)) {
+		if (libusb_get_device_list(NULL, &devs) < 0) {
+			logerror("libusb_get_device_list() failed: %s\n", libusb_error_name(status));
+			libusb_exit(NULL);
+			return -1;
+		}
+		for (i=0; (dev=devs[i]) != NULL; i++) {
+			status = libusb_get_device_descriptor(dev, &desc);
+			if (status >= 0) {
+				if (verbose >= 2)
+					logerror("trying to match against %04x:%04x\n", desc.idVendor, desc.idProduct);
+				for (j=0; j<ARRAYSIZE(known_device); j++) {
+					if ((desc.idVendor == known_device[j].vid)
+						&& (desc.idProduct == known_device[j].pid)) {
+						if ((type == NULL) && (device_id == NULL)) {
+							fx_type = known_device[j].type;
+							vid = desc.idVendor;
+							pid = desc.idProduct;
+							break;
+						} else if ((type == NULL) && (vid == desc.idVendor)
+							&& (pid == desc.idProduct)) {
+							fx_type = known_device[j].type;
+							break;
+						} else if ((device_id == NULL)
+							&& (fx_type == known_device[j].type)) {
+							vid = desc.idVendor;
+							pid = desc.idProduct;
+							break;
+						}
+					}
+				}
+				if (j < ARRAYSIZE(known_device)) {
+					if (verbose)
+						logerror("found device '%s' [%04x:%04x]\n",
+							known_device[j].designation, vid, pid);
+					break;
+				}
+			}
+		}
+		if (dev == NULL) {
+			libusb_free_device_list(devs, 1);
+			logerror("could not find a known device - please specify type and/or vid:pid\n");
+			goto usage;
+		}
+		status = libusb_open(dev, &device);
+		if (status < 0) {
+			logerror("libusb_open() failed: %s\n", libusb_error_name(status));
+			libusb_exit(NULL);
+			return -1;
+		}
+		libusb_free_device_list(devs, 1);
+	} else {
+		device = libusb_open_device_with_vid_pid(NULL, (uint16_t)vid, (uint16_t)pid);
+		if (device == NULL) {
+			logerror("libusb_open() failed\n");
+			libusb_exit(NULL);
+			return -1;
+		}
 	}
-	// We need to claim the first interface
+	/* We need to claim the first interface */
 	status = libusb_claim_interface(device, 0);
 #if defined(__linux__)
 	if (status != LIBUSB_SUCCESS) {
-		// Maybe we need to detach the driver
+		/* Maybe we need to detach the driver */
 		libusb_detach_kernel_driver(device, 0);
 		status = libusb_claim_interface(device, 0);
 	}
@@ -197,35 +260,27 @@ usage:
 		return -1;
 	}
 
-	if (type == NULL) {
-		type = "fx";	/* an21-compatible for most purposes */
-		fx2 = 0;
-	} else if (strcmp (type, "fx2lp") == 0)
-		fx2 = 2;
-	else
-		fx2 = (strcmp (type, "fx2") == 0);
-
 	if (verbose)
-		logerror("microcontroller type: %s\n", type);
+		logerror("microcontroller type: %s\n", fx_name[fx_type]);
 
-	if (stage1) {
-		/* first stage:  put loader into internal memory */
+	if (loader_path) {
+		/* first stage: put loader into internal memory */
 		if (verbose)
-			logerror("1st stage:  load 2nd stage loader\n");
-		status = ezusb_load_ram(device, stage1, fx2, 0);
+			logerror("1st stage: load 2nd stage loader\n");
+		status = ezusb_load_ram(device, loader_path, fx_type, 0);
 		if (status != 0)
 			goto out;
 
 		/* second stage ... write either EEPROM, or RAM.  */
 		if (config >= 0)
-			status = ezusb_load_eeprom(device, ihex_path, type, config);
+			status = ezusb_load_eeprom(device, firmware_path, fx_type, config);
 		else
-			status = ezusb_load_ram(device, ihex_path, fx2, 1);
+			status = ezusb_load_ram(device, firmware_path, fx_type, 1);
 	} else {
 		/* single stage, put into internal memory */
 		if (verbose)
-			logerror("single stage:  load on-chip memory\n");
-		status = ezusb_load_ram(device, ihex_path, fx2, 0);
+			logerror("single stage: load on-chip memory\n");
+		status = ezusb_load_ram(device, firmware_path, fx_type, 0);
 	}
 
 out:

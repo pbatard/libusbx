@@ -16,6 +16,7 @@ USE_MSVCRT=1
 
 UMTYPE=console
 INCLUDES=..\..\msvc;..\..\libusb;..\getopt;$(DDK_INC_PATH)
+C_DEFINES=$(C_DEFINES) /D__GNU_LIBRARY__
 UMLIBS=..\..\libusb\os\obj$(BUILD_ALT_DIR)\*\libusb-1.0.lib \
        ..\getopt\getopt_ddkbuild\obj$(BUILD_ALT_DIR)\*\getopt.lib
 SOURCES=..\ezusb.c \

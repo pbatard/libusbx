@@ -32,14 +32,14 @@ extern void logerror(const char *format, ...)
 	__attribute__ ((format(printf, 1, 2)));
 
 /*
- * This file contains functions for downloading firmware into Cypress
+ * This file contains functions for uploading firmware into Cypress
  * EZ-USB microcontrollers. These chips use control endpoint 0 and vendor
  * specific commands to support writing into the on-chip SRAM. They also
  * support writing into the CPUCS register, which is how we reset the
  * processor after loading firmware (including the reset vector).
  *
  * A second stage loader must be used when writing to off-chip memory,
- * or when downloading firmare into the bootstrap I2C EEPROM which may
+ * or when uploading firmare into the bootstrap I2C EEPROM which may
  * be available in some hardware configurations.
  *
  * These Cypress devices are 8-bit 8051 based microcontrollers with
@@ -240,7 +240,7 @@ static inline int ezusb_get_eeprom_type(libusb_device_handle *device, unsigned c
 int parse_ihex(FILE *image, void *context, bool (*is_external)(uint32_t addr, size_t len),
 	int (*poke) (void *context, uint32_t addr, bool external, const unsigned char *data, size_t len))
 {
-	uint8_t data[1023];
+	unsigned char data[1023];
 	uint32_t data_addr = 0;
 	size_t data_len = 0;
 	int rc;
@@ -248,13 +248,13 @@ int parse_ihex(FILE *image, void *context, bool (*is_external)(uint32_t addr, si
 	bool external = false;
 
 	/* Read the input file as an IHEX file, and report the memory segments
-	 * as we go.  Each line holds a max of 16 bytes, but downloading is
+	 * as we go.  Each line holds a max of 16 bytes, but uploading is
 	 * faster (and EEPROM space smaller) if we merge those lines into larger
 	 * chunks.  Most hex files keep memory segments together, which makes
 	 * such merging all but free.  (But it may still be worth sorting the
 	 * hex files to make up for undesirable behavior from tools.)
 	 *
-	 * Note that EEPROM segments max out at 1023 bytes; the download protocol
+	 * Note that EEPROM segments max out at 1023 bytes; the upload protocol
 	 * allows segments of up to 64 KBytes (more than a loader could handle).
 	 */
 	for (;;) {
@@ -369,6 +369,133 @@ int parse_ihex(FILE *image, void *context, bool (*is_external)(uint32_t addr, si
 	return 0;
 }
 
+/*
+ * Parse a binary image file and write it as is to the target.
+ * Applies to Cypress BIX images for RAM or Cypress IIC images
+ * for EEPROM.
+ *
+ * image       - the BIX image file
+ * context     - for use by poke()
+ * is_external - if non-null, used to check which segments go into
+ *               external memory (writable only by software loader)
+ * poke        - called with each memory segment; errors indicated
+ *               by returning negative values.
+ *
+ * Caller is responsible for halting CPU as needed, such as when
+ * overwriting a second stage loader.
+ */
+int parse_bin(FILE *image, void *context, bool (*is_external)(uint32_t addr, size_t len),
+	int (*poke)(void *context, uint32_t addr, bool external, const unsigned char *data, size_t len))
+{
+	unsigned char data[4096];
+	uint32_t data_addr = 0;
+	size_t data_len = 0;
+	int rc;
+	bool external = false;
+
+	for (;;) {
+		data_len = fread(data, sizeof(unsigned char), 4096, image);
+		if (data_len == 0)
+			break;
+		if (is_external)
+			external = is_external(data_addr, data_len);
+		rc = poke(context, data_addr, external, data, data_len);
+		if (rc < 0)
+			return -1;
+		data_addr += (uint32_t)data_len;
+	}
+	return feof(image)?0:-1;
+}
+
+/*
+ * Parse a Cypress IIC image file and invoke the poke() function on the
+ * various segments for writing to RAM
+ *
+ * image       - the IIC image file
+ * context     - for use by poke()
+ * is_external - if non-null, used to check which segments go into
+ *               external memory (writable only by software loader)
+ * poke        - called with each memory segment; errors indicated
+ *               by returning negative values.
+ *
+ * Caller is responsible for halting CPU as needed, such as when
+ * overwriting a second stage loader.
+ */
+int parse_iic(FILE *image, void *context, bool (*is_external)(uint32_t addr, size_t len),
+	int (*poke)(void *context, uint32_t addr, bool external, const unsigned char *data, size_t len))
+{
+	unsigned char data[4096];
+	uint32_t data_addr = 0;
+	size_t data_len = 0, read_len;
+	uint8_t block_header[4];
+	int rc;
+	bool external = false;
+	long file_size, initial_pos = ftell(image);
+
+	fseek(image, 0L, SEEK_END);
+	file_size = ftell(image);
+	fseek(image, initial_pos, SEEK_SET);
+	for (;;) {
+		/* Ignore the trailing reset IIC data (5 bytes) */
+		if (ftell(image) >= (file_size - 5))
+			break;
+		if (fread(&block_header, sizeof(uint8_t), sizeof(block_header), image) != 4) {
+			logerror("unable to read IIC block header\n");
+			return -1;
+		}
+		data_len = (block_header[0] << 8) + block_header[1];
+		data_addr = (block_header[2] << 8) + block_header[3];
+		if (data_len > sizeof(data)) {
+			/* If this is ever reported as an error, switch to using malloc/realloc */
+			logerror("IIC data block too small - please report this error to libusbx.org\n");
+			return -1;
+		}
+		read_len = fread(data, sizeof(unsigned char), data_len, image);
+		if (read_len != data_len) {
+			logerror("read error\n");
+			return -1;
+		}
+		if (is_external)
+			external = is_external(data_addr, data_len);
+		rc = poke(context, data_addr, external, data, data_len);
+		if (rc < 0)
+			return -1;
+	}
+	return 0;
+}
+
+/*
+ * Parse a Cypress IMG image file and invoke the poke() function on the
+ * various segments to implement policies such as writing to RAM (with
+ * a one or two stage loader setup, depending on the firmware) or to
+ * EEPROM (two stages required).
+ *
+ * image       - the IMG image file
+ * context     - for use by poke()
+ * is_external - if non-null, used to check which segments go into
+ *               external memory (writable only by software loader)
+ * poke        - called with each memory segment; errors indicated
+ *               by returning negative values.
+ * fx3_mode    - false if image is of Cypress 8051 BIX type (FX2 and earlier)
+ *               true if image is of Cypress ARM IMG type (FX3)
+ *
+ * Caller is responsible for halting CPU as needed, such as when
+ * overwriting a second stage loader.
+ */
+int parse_img(FILE *image, void *context, bool (*is_external)(uint32_t addr, size_t len),
+	int (*poke)(void *context, uint32_t addr, bool external, const unsigned char *data, size_t len))
+{
+	// TODO
+	logerror("IMG/FX3 support is not implemented yet\n");
+	return -1;
+}
+
+
+/* the parse call will be selected according to the image type */
+int (*parse[IMG_TYPE_MAX])(FILE *image, void *context, bool (*is_external)(uint32_t addr, size_t len),
+	int (*poke)(void *context, uint32_t addr, bool external, const unsigned char *data, size_t len))
+	= { parse_ihex, parse_iic, parse_bin, parse_img };
+
 /*****************************************************************************/
 
 /*
@@ -447,7 +574,7 @@ static int ram_poke(void *context, uint32_t addr, bool external,
 }
 
 /*
- * Load an Intel HEX file into target RAM. The fd is the open "usbfs"
+ * Load a firmware file into target RAM. device is the open libusbx
  * device, and the path is the name of the source file. Open the file,
  * parse the bytes, and write them in one or two phases.
  *
@@ -460,46 +587,61 @@ static int ram_poke(void *context, uint32_t addr, bool external,
  * memory is written, expecting a second stage loader to have already
  * been loaded.  Then file is re-parsed and on-chip memory is written.
  */
-int ezusb_load_ram(libusb_device_handle *device, const char *path, int fx_type, int stage)
+int ezusb_load_ram(libusb_device_handle *device, const char *path, int fx_type, int img_type, int stage)
 {
 	FILE *image;
 	uint32_t cpucs_addr;
 	bool (*is_external)(uint32_t off, size_t len);
 	struct ram_poke_context ctx;
 	int status;
+	uint8_t iic_header[8] = { 0 };
 
 	image = fopen(path, "rb");
 	if (image == NULL) {
 		logerror("%s: unable to open for input.\n", path);
 		return -2;
 	} else if (verbose)
-		logerror("open RAM hexfile image %s\n", path);
+		logerror("open firmware image %s for RAM upload\n", path);
+
+	if (img_type == IMG_TYPE_IIC) {
+		if ( (fread(iic_header, sizeof(uint8_t), sizeof(iic_header), image) != sizeof(iic_header))
+		  || (((fx_type == FX_TYPE_FX2LP) || (fx_type == FX_TYPE_FX2)) && (iic_header[0] != 0xC2))
+		  || ((fx_type == FX_TYPE_AN21) && (iic_header[0] != 0xB2))
+		  || ((fx_type == FX_TYPE_FX1) && (iic_header[0] != 0xB6)) ) {
+			logerror("IIC image does not contain executable code - cannot load to RAM.\n", path);
+			return -1;
+		}
+	}
 
 	/* EZ-USB original/FX and FX2 devices differ, apart from the 8051 core */
-	if (fx_type == FX_TYPE_FX2LP) {
+	switch(fx_type) {
+	case FX_TYPE_FX2LP:
 		cpucs_addr = 0xe600;
 		is_external = fx2lp_is_external;
-	} else if (fx_type == FX_TYPE_FX2) {
+		break;
+	case FX_TYPE_FX2:
 		cpucs_addr = 0xe600;
 		is_external = fx2_is_external;
-	} else if (fx_type == FX_TYPE_FX3) {
-		// TODO
-		cpucs_addr = 0;
+		break;
+	case FX_TYPE_FX3:
+		cpucs_addr = 0;	/* CPUCS of zero means CPUCS actions are disabled */
 		is_external = fx3_is_external;
-	} else {
+		break;
+	default:
 		cpucs_addr = 0x7f92;
 		is_external = fx_is_external;
+		break;
 	}
 
 	/* use only first stage loader? */
-	if (!stage) {
+	if (stage == 0) {
 		ctx.mode = internal_only;
 
-		/* don't let CPU run while we overwrite its code/data */
-		if (!ezusb_cpucs(device, cpucs_addr, 0))
+		/* if required, halt the CPU while we overwrite its code/data */
+		if (cpucs_addr && !ezusb_cpucs(device, cpucs_addr, false))
 			return -1;
 
-		/* 2nd stage, first part? loader was already downloaded */
+		/* 2nd stage, first part? loader was already uploaded */
 	} else {
 		ctx.mode = skip_internal;
 
@@ -511,18 +653,19 @@ int ezusb_load_ram(libusb_device_handle *device, const char *path, int fx_type, 
 	/* scan the image, first (maybe only) time */
 	ctx.device = device;
 	ctx.total = ctx.count = 0;
-	status = parse_ihex(image, &ctx, is_external, ram_poke);
+	status = parse[img_type](image, &ctx, is_external, ram_poke);
 	if (status < 0) {
-		logerror("unable to download %s\n", path);
+		logerror("unable to upload %s\n", path);
 		return status;
 	}
 
 	/* second part of 2nd stage: rescan */
+	// TODO: what should we do for non HEX images there?
 	if (stage) {
 		ctx.mode = skip_external;
 
-		/* don't let CPU run while we overwrite the 1st stage loader */
-		if (!ezusb_cpucs(device, cpucs_addr, 0))
+		/* if needed, halt the CPU while we overwrite the 1st stage loader */
+		if (cpucs_addr && !ezusb_cpucs(device, cpucs_addr, false))
 			return -1;
 
 		/* at least write the interrupt vectors (at 0x0000) for reset! */
@@ -531,7 +674,7 @@ int ezusb_load_ram(libusb_device_handle *device, const char *path, int fx_type, 
 			logerror("2nd stage: write on-chip memory\n");
 		status = parse_ihex(image, &ctx, is_external, ram_poke);
 		if (status < 0) {
-			logerror("unable to completely download %s\n", path);
+			logerror("unable to completely upload %s\n", path);
 			return status;
 		}
 	}
@@ -540,8 +683,8 @@ int ezusb_load_ram(libusb_device_handle *device, const char *path, int fx_type, 
 		logerror("... WROTE: %d bytes, %d segments, avg %d\n",
 		ctx.total, ctx.count, ctx.total / ctx.count);
 
-	/* now reset the CPU so it runs what we just downloaded */
-	if (!ezusb_cpucs(device, cpucs_addr, 1))
+	/* if required, reset the CPU so it runs what we just uploaded */
+	if (cpucs_addr && !ezusb_cpucs(device, cpucs_addr, true))
 		return -1;
 
 	return 0;
@@ -606,15 +749,17 @@ static int eeprom_poke(void *context, uint32_t addr, bool external,
 }
 
 /*
- * Load an Intel HEX file into target (large) EEPROM, set up to boot from
+ * Load an image file into target (large) EEPROM, set up to boot from
  * that EEPROM using the specified microcontroller-specific config byte.
- * (Defaults: FX2 0x08, FX 0x00, AN21xx n/a)
+ * (Defaults: FX2 0x08, FX 0x00, AN21xx n/a).
+ * If an IIC image is used, the config byte is ignored and the image is
+ * written as is.
  *
  * Caller must have pre-loaded a second stage loader that knows how
  * to handle the EEPROM write requests.
  */
 int ezusb_load_eeprom(libusb_device_handle *device, const char *path,
-	int fx_type, int config)
+	int fx_type, int img_type, int config)
 {
 	FILE *image;
 	uint32_t cpucs_addr;
@@ -633,7 +778,7 @@ int ezusb_load_eeprom(libusb_device_handle *device, const char *path,
 		logerror("%s: unable to open for input.\n", path);
 		return -2;
 	} else if (verbose)
-		logerror("open EEPROM hexfile image %s\n", path);
+		logerror("open firmware image %s for EEPROM write\n", path);
 
 	if (verbose)
 		logerror("2nd stage: write boot EEPROM\n");
@@ -662,7 +807,7 @@ int ezusb_load_eeprom(libusb_device_handle *device, const char *path,
 		is_external = fx2lp_is_external;
 		ctx.ee_addr = 8;
 		config &= 0x4f;
-		fprintf(stderr,
+		logerror(
 			"FX2LP: config = 0x%02x, %sconnected, I2C = %d KHz\n",
 			config,
 			(config & 0x40) ? "dis" : "",
@@ -696,11 +841,20 @@ int ezusb_load_eeprom(libusb_device_handle *device, const char *path,
 
 	case FX_TYPE_FX3:
 		// TODO
-		break;
+		logerror("FX3 EEPROM support is not implemented yet\n");
+		return -1;
 
 	default:
 		logerror("?? Unrecognized microcontroller type %d ??\n", fx_type);
 		return -1;
+	}
+
+	ctx.device = device;
+	ctx.last = 0;
+
+	/* IIC is the EEPROM format => just write as is */
+	if (img_type == IMG_TYPE_IIC) {
+		return parse_bin(image, &ctx, is_external, eeprom_poke);
 	}
 
 	/* make sure the EEPROM won't be used for booting,
@@ -713,9 +867,7 @@ int ezusb_load_eeprom(libusb_device_handle *device, const char *path,
 		return status;
 
 	/* scan the image, write to EEPROM */
-	ctx.device = device;
-	ctx.last = 0;
-	status = parse_ihex(image, &ctx, is_external, eeprom_poke);
+	status = parse[img_type](image, &ctx, is_external, eeprom_poke);
 	if (status < 0) {
 		logerror("unable to write EEPROM %s\n", path);
 		return status;

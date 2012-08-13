@@ -21,25 +21,16 @@
  */
 
 /*
- * This program supports loading firmware into a target USB device
- * that is discovered and referenced by the hotplug usb agent. It can
- * also do other useful things, like set the permissions of the device
- * and create a symbolic link for the benefit of applications that are
- * looking for the device.
+ * This program supports uploading firmware into a target USB device.
  *
- *     -I <path>       -- Download this firmware (intel hex)
- *     -t <type>       -- uController type: an21, fx, fx2, fx2lp
- *     -s <path>       -- use this second stage loader
- *     -c <byte>       -- Download to EEPROM, with this config byte
+ *     -I <path>       -- Upload this firmware
+ *     -t <type>       -- uController type: an21, fx, fx2, fx2lp, fx3
+ *     -s <path>       -- Use this second stage loader
+ *     -c <byte>       -- Upload to EEPROM, with this config byte
  *
  *     -D <vid:pid>    -- Use this device, instead of $DEVICE
  *
  *     -V              -- Print version ID for program
- *
- * This program is intended to be started by hotplug scripts in
- * response to a device appearing on the bus. It therefore also
- * expects these environment variables which are passed by hotplug to
- * its sub-scripts:
  */
 #include <stdlib.h>
 #include <stdio.h>
@@ -52,9 +43,10 @@
 #include <libusb.h>
 #include "ezusb.h"
 
-#if !defined(_WIN32)
+#if !defined(_WIN32) || defined(__CYGWIN__ )
 #include <syslog.h>
 static bool dosyslog = false;
+#define _stricmp stricmp
 #endif
 
 #ifndef FXLOAD_VERSION
@@ -73,7 +65,7 @@ void logerror(const char *format, ...)
 	va_list ap;
 	va_start(ap, format);
 
-#if !defined(_WIN32)
+#if !defined(_WIN32) || defined(__CYGWIN__ )
 	if (dosyslog)
 		vsyslog(LOG_ERR, format, ap);
 	else
@@ -83,15 +75,18 @@ void logerror(const char *format, ...)
 	va_end(ap);
 }
 
+#define FIRMWARE 0
+#define LOADER 1
 int main(int argc, char*argv[])
 {
 	fx_known_device known_device[] = FX_KNOWN_DEVICES;
-	const char *firmware_path = NULL, *loader_path = NULL;
+	const char *path[] = { NULL, NULL };
 	const char *device_id = getenv("DEVICE");
 	const char *type = NULL;
 	const char *fx_name[FX_TYPE_MAX] = FX_TYPE_NAMES;
-	int opt, status, fx_type = FX_TYPE_UNDEFINED;
-	int i, j, config = -1;
+	const char *ext, *img_name[] = IMG_TYPE_NAMES;
+	int fx_type = FX_TYPE_UNDEFINED, img_type[ARRAYSIZE(path)];
+	int i, j, opt, status, config = -1;
 	unsigned vid = 0, pid = 0;
 	libusb_device *dev, **devs;
 	libusb_device_handle *device = NULL;
@@ -105,7 +100,7 @@ int main(int argc, char*argv[])
 			break;
 
 		case 'I':
-			firmware_path = optarg;
+			path[FIRMWARE] = optarg;
 			break;
 
 		case 'V':
@@ -121,7 +116,7 @@ int main(int argc, char*argv[])
 			break;
 
 		case 's':
-			loader_path = optarg;
+			path[LOADER] = optarg;
 			break;
 
 		case 't':
@@ -139,17 +134,13 @@ int main(int argc, char*argv[])
 	}
 
 	if (config >= 0) {
-		if (type == 0) {
-			logerror("must specify microcontroller type to write EEPROM!\n");
-			goto usage;
-		}
-		if (!loader_path || !firmware_path) {
+		if ((path[FIRMWARE] == NULL) || (path[LOADER] == NULL)) {
 			logerror("need 2nd stage loader and firmware to write EEPROM!\n");
 			goto usage;
 		}
 	}
 
-	if (firmware_path == NULL) {
+	if (path[FIRMWARE] == NULL) {
 		logerror("no firmware specified!\n");
 usage:
 		fprintf(stderr, "\nusage: %s [-vV] [-t type] [-D vid:pid] -I firmware\n", argv[0]);
@@ -189,8 +180,7 @@ usage:
 	if ((type == NULL) || (device_id == NULL)) {
 		if (libusb_get_device_list(NULL, &devs) < 0) {
 			logerror("libusb_get_device_list() failed: %s\n", libusb_error_name(status));
-			libusb_exit(NULL);
-			return -1;
+			goto err;
 		}
 		for (i=0; (dev=devs[i]) != NULL; i++) {
 			status = libusb_get_device_descriptor(dev, &desc);
@@ -233,16 +223,14 @@ usage:
 		status = libusb_open(dev, &device);
 		if (status < 0) {
 			logerror("libusb_open() failed: %s\n", libusb_error_name(status));
-			libusb_exit(NULL);
-			return -1;
+			goto err;
 		}
 		libusb_free_device_list(devs, 1);
 	} else {
 		device = libusb_open_device_with_vid_pid(NULL, (uint16_t)vid, (uint16_t)pid);
 		if (device == NULL) {
 			logerror("libusb_open() failed\n");
-			libusb_exit(NULL);
-			return -1;
+			goto err;
 		}
 	}
 	/* We need to claim the first interface */
@@ -256,31 +244,58 @@ usage:
 #endif
 	if (status != LIBUSB_SUCCESS) {
 		logerror("libusb_claim_interface failed: %s\n", libusb_error_name(status));
-		libusb_exit(NULL);
-		return -1;
+		goto err;
 	}
 
 	if (verbose)
 		logerror("microcontroller type: %s\n", fx_name[fx_type]);
 
-	if (loader_path) {
+	for (i=0; i<ARRAYSIZE(path); i++) {
+		if (path[i] != NULL) {
+			ext = path[i] + strlen(path[i]) - 4;
+			if ((_stricmp(ext, ".hex") == 0) || (strcmp(ext, ".ihx") == 0))
+				img_type[i] = IMG_TYPE_HEX;
+			else if (_stricmp(ext, ".iic") == 0)
+				img_type[i] = IMG_TYPE_IIC;
+			else if (_stricmp(ext, ".bix") == 0)
+				img_type[i] = IMG_TYPE_BIX;
+			else if (_stricmp(ext, ".img") == 0)
+				img_type[i] = IMG_TYPE_IMG;
+			else {
+				logerror("%s is not a recognized image type\n", path[i]);
+				goto err;
+			}
+		}
+		if (verbose && path[i] != NULL)
+			logerror("%s: type %s\n", path[i], img_name[img_type[i]]);
+
+		if ((fx_type == FX_TYPE_FX3) && (img_type[i] != IMG_TYPE_IMG)) {
+			logerror("only IMG files are supported for this target\n");
+			goto err;
+		} else if ((fx_type != FX_TYPE_FX3) && (img_type[i] == IMG_TYPE_IMG)) {
+			logerror("IMG files are not supported with this target\n");
+			goto err;
+		}
+	}
+
+	if (path[LOADER]) {
 		/* first stage: put loader into internal memory */
 		if (verbose)
 			logerror("1st stage: load 2nd stage loader\n");
-		status = ezusb_load_ram(device, loader_path, fx_type, 0);
+		status = ezusb_load_ram(device, path[LOADER], fx_type, img_type[LOADER], 0);
 		if (status != 0)
 			goto out;
 
-		/* second stage ... write either EEPROM, or RAM.  */
-		if (config >= 0)
-			status = ezusb_load_eeprom(device, firmware_path, fx_type, config);
+		/* second stage ... write either EEPROM, or RAM. */
+		if ((config >= 0) || (img_type[FIRMWARE] == IMG_TYPE_IIC))
+			status = ezusb_load_eeprom(device, path[FIRMWARE], fx_type, img_type[FIRMWARE], config);
 		else
-			status = ezusb_load_ram(device, firmware_path, fx_type, 1);
+			status = ezusb_load_ram(device, path[FIRMWARE], fx_type, img_type[FIRMWARE], 1);
 	} else {
 		/* single stage, put into internal memory */
 		if (verbose)
 			logerror("single stage: load on-chip memory\n");
-		status = ezusb_load_ram(device, firmware_path, fx_type, 0);
+		status = ezusb_load_ram(device, path[FIRMWARE], fx_type, img_type[FIRMWARE], 0);
 	}
 
 out:
@@ -288,4 +303,7 @@ out:
 	libusb_close(device);
 	libusb_exit(NULL);
 	return status;
+err:
+	libusb_exit(NULL);
+	return -1;
 }

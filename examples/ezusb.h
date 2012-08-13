@@ -44,8 +44,15 @@
 #define FX_TYPE_FX2LP      3	/* Updated FX2 */
 #define FX_TYPE_FX3        4	/* USB 3.0 versions */
 #define FX_TYPE_MAX        5
-
 #define FX_TYPE_NAMES      { "an21", "fx", "fx2", "fx2lp", "fx3" }
+
+#define IMG_TYPE_UNDEFINED -1
+#define IMG_TYPE_HEX       0	/* Intel HEX */
+#define IMG_TYPE_IIC       1	/* Cypress 8051 IIC */
+#define IMG_TYPE_BIX       2	/* Cypress 8051 BIX */
+#define IMG_TYPE_IMG       3	/* Cypress ARM IMG */
+#define IMG_TYPE_MAX       4
+#define IMG_TYPE_NAMES     { "Intel HEX", "Cypress 8051 IIC", "Cypress 8051 BIX", "Cypress ARM IMG" }
 
 /* 
  * Automatically identified devices (VID, PID, type, designation).
@@ -74,30 +81,29 @@ typedef struct {
 }
 
 /*
- * This function loads the firmware from the given file into RAM.
- * The file is assumed to be in Intel HEX format.  If fx2 is set, uses
- * appropriate reset commands.  Stage == 0 means this is a single stage
- * load (or the first of two stages).  Otherwise it's the second of
- * two stages; the caller preloaded the second stage loader.
+ * This function uploads the firmware from the given file into RAM.
+ * Stage == 0 means this is a single stage load (or the first of
+ * two stages).  Otherwise it's the second of two stages; the 
+ * caller having preloaded the second stage loader.
  *
- * The target processor is reset at the end of this download.
+ * The target processor is reset at the end of this upload.
  */
 extern int ezusb_load_ram(libusb_device_handle *device,
-	const char *path, int fx_type, int stage);
+	const char *path, int fx_type, int img_type, int stage);
 
 /*
- * This function stores the firmware from the given file into EEPROM.
- * The file is assumed to be in Intel HEX format.  This uses the right
- * CPUCS address to terminate the EEPROM load with a reset command,
- * where FX parts behave differently than FX2 ones.  The configuration
- * byte is as provided here (zero for an21xx parts) and the EEPROM
- * type is set so that the microcontroller will boot from it.
+ * This function uploads the firmware from the given file into EEPROM.
+ * This uses the right CPUCS address to terminate the EEPROM load with
+ * a reset command where FX parts behave differently than FX2 ones.
+ * The configuration byte is as provided here (zero for an21xx parts)
+ * and the EEPROM type is set so that the microcontroller will boot
+ * from it.
  *
  * The caller must have preloaded a second stage loader that knows
  * how to respond to the EEPROM write request.
  */
 extern int ezusb_load_eeprom(libusb_device_handle *device,
-	const char *path, int fx_type, int config);
+	const char *path, int fx_type, int img_type, int config);
 
 /* boolean flag, says whether to write extra messages to stderr */
 extern int verbose;

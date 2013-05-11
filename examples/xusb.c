@@ -165,6 +165,16 @@ static void display_buffer_hex(unsigned char *buffer, unsigned size)
 	printf("\n" );
 }
 
+static char* uuid_to_string(const uint8_t* uuid)
+{
+	static char uuid_string[40];
+	if (uuid == NULL) return NULL;
+	sprintf(uuid_string, "{%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x}",
+		uuid[0], uuid[1], uuid[2], uuid[3], uuid[4], uuid[5], uuid[6], uuid[7],
+		uuid[8], uuid[9], uuid[10], uuid[11], uuid[12], uuid[13], uuid[14], uuid[15]);
+	return uuid_string;
+}
+
 // The PS3 Controller is really a HID device that got its HID Report Descriptors
 // removed by Sony
 static int display_ps3_status(libusb_device_handle *handle)
@@ -731,6 +741,7 @@ static int test_device(uint16_t vid, uint16_t pid)
 	libusb_device_handle *handle;
 	libusb_device *dev;
 	uint8_t bus, port_path[8];
+	struct libusb_bos_descriptor *bos_desc;
 	struct libusb_config_descriptor *conf_desc;
 	const struct libusb_endpoint_descriptor *endpoint;
 	int i, j, k, r;
@@ -784,7 +795,27 @@ static int test_device(uint16_t vid, uint16_t pid)
 	string_index[1] = dev_desc.iProduct;
 	string_index[2] = dev_desc.iSerialNumber;
 
-	printf("\nReading configuration descriptors:\n");
+	printf("\nReading BOS descriptor: ");
+	if (libusb_get_bos_descriptor(handle, &bos_desc) == LIBUSB_SUCCESS) {
+		printf("%d caps\n", bos_desc->bNumDeviceCaps);
+		if (bos_desc->ss_usb_dev_cap != NULL) {
+			printf("    USB 3.0 capabilities:\n");
+			printf("      supported speeds       : %04X\n", bos_desc->ss_usb_dev_cap->wSpeedSupported);
+			printf("      supported functionality: %02X\n", bos_desc->ss_usb_dev_cap->bFunctionalitySupport);
+		}
+		if (bos_desc->usb_2_0_extension != NULL) {
+			printf("    USB 2.0 extension:\n");
+			printf("      attributes             : %02X\n", bos_desc->usb_2_0_extension->bmAttributes);
+		}
+		if (bos_desc->container_id != NULL) {
+			printf("    Container ID:\n      %s\n", uuid_to_string(bos_desc->container_id->ContainerID));
+		}
+		libusb_free_bos_descriptor(bos_desc);
+	} else {
+		printf("no descriptor\n");
+	}
+
+	printf("\nReading first configuration descriptor:\n");
 	CALL_CHECK(libusb_get_config_descriptor(dev, 0, &conf_desc));
 	nb_ifaces = conf_desc->bNumInterfaces;
 	printf("             nb interfaces: %d\n", nb_ifaces);
@@ -822,6 +853,10 @@ static int test_device(uint16_t vid, uint16_t pid)
 				}
 				printf("           max packet size: %04X\n", endpoint->wMaxPacketSize);
 				printf("          polling interval: %02X\n", endpoint->bInterval);
+				if (endpoint->ss_endpoint_companion != NULL) {
+					printf("                 max burst: %02X   (USB 3.0)\n", endpoint->ss_endpoint_companion->bMaxBurst);
+					printf("        bytes per interval: %04X (USB 3.0)\n", endpoint->ss_endpoint_companion->wBytesPerInterval);
+				}
 			}
 		}
 	}

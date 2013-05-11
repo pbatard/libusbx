@@ -253,6 +253,12 @@ enum libusb_descriptor_type {
 	/** Endpoint descriptor. See libusb_endpoint_descriptor. */
 	LIBUSB_DT_ENDPOINT = 0x05,
 
+	/** BOS descriptor */
+	LIBUSB_DT_BOS = 0x0f,
+
+	/** Device Capability descriptor */
+	LIBUSB_DT_DEVICE_CAPABILITY = 0x10,
+
 	/** HID descriptor */
 	LIBUSB_DT_HID = 0x21,
 
@@ -266,16 +272,32 @@ enum libusb_descriptor_type {
 	LIBUSB_DT_HUB = 0x29,
 
 	/** SuperSpeed Hub descriptor */
-	LIBUSB_DT_SUPERSPEED_HUB = 0x2A,
+	LIBUSB_DT_SUPERSPEED_HUB = 0x2a,
+
+	/** SuperSpeed Endpoint Companion descriptor */
+	LIBUSB_DT_SS_ENDPOINT_COMPANION = 0x30
 };
 
 /* Descriptor sizes per descriptor type */
 #define LIBUSB_DT_DEVICE_SIZE			18
 #define LIBUSB_DT_CONFIG_SIZE			9
 #define LIBUSB_DT_INTERFACE_SIZE		9
-#define LIBUSB_DT_ENDPOINT_SIZE		7
+#define LIBUSB_DT_ENDPOINT_SIZE			7
 #define LIBUSB_DT_ENDPOINT_AUDIO_SIZE	9	/* Audio extension */
 #define LIBUSB_DT_HUB_NONVAR_SIZE		7
+#define LIBUSB_DT_SS_ENDPOINT_COMPANION_SIZE	6
+#define LIBUSB_DT_BOS_SIZE				5
+
+/* BOS descriptor sizes */
+#define LIBUSB_BT_USB_2_0_EXTENSION_SIZE		7
+#define LIBUSB_BT_SS_USB_DEVICE_CAPABILITY_SIZE	10
+#define LIBUSB_BT_CONTAINER_ID_SIZE				20
+
+/* We unwrap the BOS => define its max size */
+#define LIBUSB_DT_BOS_MAX_SIZE		((LIBUSB_DT_BOS_SIZE)     +\
+					(LIBUSB_BT_USB_2_0_EXTENSION_SIZE)       +\
+					(LIBUSB_BT_SS_USB_DEVICE_CAPABILITY_SIZE) +\
+					(LIBUSB_BT_CONTAINER_ID_SIZE))
 
 #define LIBUSB_ENDPOINT_ADDRESS_MASK	0x0f    /* in bEndpointAddress */
 #define LIBUSB_ENDPOINT_DIR_MASK		0x80
@@ -490,6 +512,38 @@ struct libusb_device_descriptor {
 };
 
 /** \ingroup desc
+ * A structure representing the superspeed endpoint companion
+ * descriptor. This descriptor is documented in section 9.6.7 of
+ * the USB 3.0 specification. All multiple-byte fields are represented in
+ * host-endian format.
+ */
+struct libusb_ss_endpoint_companion_descriptor {
+
+	/** Size of this descriptor (in bytes) */
+	uint8_t  bLength;
+
+	/** Descriptor type. Will have value
+	 * \ref libusb_descriptor_type::LIBUSB_DT_SS_ENDPOINT_COMPANION in
+	 * this context. */
+	uint8_t  bDescriptorType;
+
+
+	/** The maximum number of packets the endpoint can send or
+	 *  recieve as part of a burst. */
+	uint8_t  bMaxBurst;
+
+	/** In bulk EP:	bits 4:0 represents the	maximum	number of
+	 *  streams the	EP supports. In	isochronous EP:	bits 1:0
+	 *  represents the Mult	- a zero based value that determines
+	 *  the	maximum	number of packets within a service interval  */
+	uint8_t  bmAttributes;
+
+	/** The	total number of bytes this EP will transfer every
+	 *  service interval. valid only for periodic EPs. */
+	uint16_t wBytesPerInterval;
+};
+
+/** \ingroup desc
  * A structure representing the standard USB endpoint descriptor. This
  * descriptor is documented in section 9.6.6 of the USB 3.0 specification.
  * All multiple-byte fields are represented in host-endian format.
@@ -530,6 +584,9 @@ struct libusb_endpoint_descriptor {
 
 	/** For audio devices only: the address if the synch endpoint */
 	uint8_t  bSynchAddress;
+
+	/** SuperSpeed Endpoint Companion descriptor */
+	struct libusb_ss_endpoint_companion_descriptor *ss_endpoint_companion;
 
 	/** Extra descriptors. If libusbx encounters unknown endpoint descriptors,
 	 * it will store them here, should you wish to parse them. */
@@ -645,6 +702,134 @@ struct libusb_config_descriptor {
 
 	/** Length of the extra descriptors, in bytes. */
 	int extra_length;
+};
+
+/** \ingroup desc
+ * A structure representing the Binary Device Object Store (BOS) descriptor.
+ * This descriptor is documented in section 9.6.2 of the USB 3.0 specification.
+ * All multiple-byte fields, except UUIDs, are represented in host-endian format.
+ */
+struct libusb_bos_descriptor {
+	/** Size of this descriptor (in bytes) */
+	uint8_t  bLength;
+
+	/** Descriptor type. Will have value
+	 * \ref libusb_descriptor_type::LIBUSB_DT_BOS LIBUSB_DT_BOS
+	 * in this context. */
+	uint8_t  bDescriptorType;
+
+	/** Length of this descriptor and all of its sub descriptors */
+	uint16_t wTotalLength;
+
+	/** The number of separate device capability descriptors in
+	 * the BOS */
+	uint8_t  bNumDeviceCaps;
+
+	/* The following assumes that only one descriptor of the following
+	 * types will ever be provided by the device for each endpoint... */
+
+	/** USB 2.0 Extension descriptor */
+	struct libusb_usb_2_0_extension_descriptor *usb_2_0_extension;
+
+	/** SuperSpeed USB Device Capability descriptor */
+	struct libusb_ss_usb_device_capability_descriptor *ss_usb_dev_cap;
+
+	/** USB 3.0 Container ID descriptor */
+	struct libusb_container_id_descriptor *container_id;
+};
+
+/** \ingroup desc
+ * A structure representing the USB 2.0 Extension descriptor
+ * This descriptor is documented in section 9.6.2.1 of the USB 3.0 specification.
+ * All multiple-byte fields are represented in host-endian format.
+ */
+struct libusb_usb_2_0_extension_descriptor {
+	/** Size of this descriptor (in bytes) */
+	uint8_t  bLength;
+
+	/** Descriptor type. Will have value
+	 * \ref libusb_descriptor_type::LIBUSB_DT_DEVICE_CAPABILITY
+	 * LIBUSB_DT_DEVICE_CAPABILITY in this context. */
+	uint8_t  bDescriptorType;
+
+	/** Capability type. Will have value
+	 * \ref libusb_capability_type::LIBUSB_BT_USB_2_0_EXTENSION
+	 * LIBUSB_BT_USB_2_0_EXTENSION in this context. */
+	uint8_t  bDevCapabilityType;
+
+	/** Bitmap encoding of supported device level features.
+	 * A value of one in a bit location indicates a feature is
+	 * supported; a value of zero indicates it is not supported.
+	 * See \ref libusb_capability_attributes. */
+	uint32_t  bmAttributes;
+};
+
+/** \ingroup desc
+ * A structure representing the SuperSpeed USB Device Capability descriptor
+ * This descriptor is documented in section 9.6.2.2 of the USB 3.0 specification.
+ * All multiple-byte fields are represented in host-endian format.
+ */
+struct libusb_ss_usb_device_capability_descriptor {
+	/** Size of this descriptor (in bytes) */
+	uint8_t  bLength;
+
+	/** Descriptor type. Will have value
+	 * \ref libusb_descriptor_type::LIBUSB_DT_DEVICE_CAPABILITY
+	 * LIBUSB_DT_DEVICE_CAPABILITY in this context. */
+	uint8_t  bDescriptorType;
+
+	/** Capability type. Will have value
+	 * \ref libusb_capability_type::LIBUSB_BT_SS_USB_DEV_CAP
+	 * LIBUSB_BT_SS_USB_DEV_CAP in this context. */
+	uint8_t  bDevCapabilityType;
+
+	/** Bitmap encoding of supported device level features.
+	 * A value of one in a bit location indicates a feature is
+	 * supported; a value of zero indicates it is not supported.
+	 * See \ref libusb_capability_attributes. */
+	uint8_t  bmAttributes;
+
+	/** Bitmap encoding of the speed supported by this device when
+	 * operating in SuperSpeed mode. See \ref libusb_supported_speed. */
+	uint16_t wSpeedSupported;
+
+	/** The lowest speed at which all the functionality supported
+	 * by the device is available to the user. For example if the
+	 * device supports all its functionality when connected at
+	 * full speed and above then it sets this value to 1. */
+	uint8_t  bFunctionalitySupport;
+
+	/** U1 Device Exit Latency. */
+	uint8_t  bU1DevExitLat;
+
+	/** U2 Device Exit Latency. */
+	uint16_t bU2DevExitLat;
+};
+
+/** \ingroup desc
+ * A structure representing the Container ID descriptor.
+ * This descriptor is documented in section 9.6.2.3 of the USB 3.0 specification.
+ * All multiple-byte fields are represented in host-endian format.
+ */
+struct libusb_container_id_descriptor {
+	/** Size of this descriptor (in bytes) */
+	uint8_t  bLength;
+
+	/** Descriptor type. Will have value
+	 * \ref libusb_descriptor_type::LIBUSB_DT_DEVICE_CAPABILITY
+	 * LIBUSB_DT_DEVICE_CAPABILITY in this context. */
+	uint8_t  bDescriptorType;
+
+	/** Capability type. Will have value
+	 * \ref libusb_capability_type::LIBUSB_BT_CONTAINER_ID
+	 * LIBUSB_BT_CONTAINER_ID in this context. */
+	uint8_t  bDevCapabilityType;
+
+	/** Reserved field */
+	uint8_t bReserved;
+
+	/** 128 bit UUID */
+	uint8_t  ContainerID[16];
 };
 
 /** \ingroup asyncio
@@ -771,6 +956,48 @@ enum libusb_speed {
 
 	/** The device is operating at super speed (5000MBit/s). */
 	LIBUSB_SPEED_SUPER = 4,
+};
+
+/** \ingroup dev
+ * Supported speeds (wSpeedSupported) bitfield. Indicates what
+ * speeds the device supports.
+ */
+enum libusb_supported_speed {
+	/** Low speed operation supported (1.5MBit/s). */
+	LIBUSB_LOW_SPEED_OPERATION   = 1,
+
+	/** Full speed operation supported (12MBit/s). */
+	LIBUSB_FULL_SPEED_OPERATION  = 2,
+
+	/** High speed operation supported (480MBit/s). */
+	LIBUSB_HIGH_SPEED_OPERATION  = 4,
+
+	/** Superspeed operation supported (5000MBit/s). */
+	LIBUSB_SUPER_SPEED_OPERATION = 8,
+};
+
+/** \ingroup dev
+ * Capability attributes
+ */
+enum libusb_bos_attributes {
+	/** Supports Link Power Management (LPM) */
+	LIBUSB_BA_LPM_SUPPORT = 2,
+};
+
+/** \ingroup dev
+ * USB capability types
+ */
+enum libusb_bos_type {
+	/* Wireless USB is ignored */
+
+	/** USB 2.0 extensions */
+	LIBUSB_BT_USB_2_0_EXTENSION = 2,
+
+	/** SuperSpeed capability */
+	LIBUSB_BT_SS_USB_DEV_CAP    = 3,
+
+	/** Container ID type */
+	LIBUSB_BT_CONTAINER_ID      = 4
 };
 
 /** \ingroup misc
@@ -1051,6 +1278,8 @@ int LIBUSB_CALL libusb_get_config_descriptor_by_value(libusb_device *dev,
 	uint8_t bConfigurationValue, struct libusb_config_descriptor **config);
 void LIBUSB_CALL libusb_free_config_descriptor(
 	struct libusb_config_descriptor *config);
+int LIBUSB_CALL libusb_get_bos_descriptor(libusb_device_handle *handle, struct libusb_bos_descriptor **bos);
+void LIBUSB_CALL libusb_free_bos_descriptor(struct libusb_bos_descriptor *bos);
 uint8_t LIBUSB_CALL libusb_get_bus_number(libusb_device *dev);
 uint8_t LIBUSB_CALL libusb_get_port_number(libusb_device *dev);
 libusb_device * LIBUSB_CALL libusb_get_parent(libusb_device *dev);

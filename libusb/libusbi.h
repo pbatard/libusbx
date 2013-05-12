@@ -224,6 +224,11 @@ struct libusb_context {
 	struct list_head open_devs;
 	usbi_mutex_t open_devs_lock;
 
+	/* A list of registered hotplug callbacks */
+	struct list_head hotplug_cbs;
+	usbi_mutex_t hotplug_cbs_lock;
+	int hotplug_pipe[2];
+
 	/* this is a list of in-flight transfer handles, sorted by timeout
 	 * expiration. URBs to timeout the soonest are placed at the beginning of
 	 * the list, URBs that will time out later are placed after, and urbs with
@@ -290,8 +295,15 @@ struct libusb_device {
 	unsigned long session_data;
 
 	struct libusb_device_descriptor device_descriptor;
+	int attached;
 
-	unsigned char os_priv[0];
+	unsigned char os_priv
+#if defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 199901L)
+	[] /* valid C99 code */
+#else
+	[0] /* non-standard, but usually working code */
+#endif
+	;
 };
 
 struct libusb_device_handle {
@@ -301,7 +313,13 @@ struct libusb_device_handle {
 
 	struct list_head list;
 	struct libusb_device *dev;
-	unsigned char os_priv[0];
+	unsigned char os_priv
+#if defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 199901L)
+	[] /* valid C99 code */
+#else
+	[0] /* non-standard, but usually working code */
+#endif
+	;
 };
 
 enum {
@@ -401,6 +419,9 @@ int usbi_device_cache_descriptor(libusb_device *dev);
 int usbi_get_config_index_by_value(struct libusb_device *dev,
 	uint8_t bConfigurationValue, int *idx);
 
+void usbi_connect_device (struct libusb_device *dev);
+void usbi_disconnect_device (struct libusb_device *dev);
+
 /* Internal abstraction for poll (needs struct usbi_transfer on Windows) */
 #if defined(OS_LINUX) || defined(OS_DARWIN) || defined(OS_OPENBSD)
 #include <unistd.h>
@@ -442,7 +463,13 @@ void usbi_fd_notification(struct libusb_context *ctx);
 struct discovered_devs {
 	size_t len;
 	size_t capacity;
-	struct libusb_device *devices[0];
+	struct libusb_device *devices
+#if defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 199901L)
+	[] /* valid C99 code */
+#else
+	[0] /* non-standard, but usually working code */
+#endif
+	;
 };
 
 struct discovered_devs *discovered_devs_append(

@@ -1687,9 +1687,6 @@ static void darwin_async_io_callback (void *refcon, IOReturn result, void *arg0)
 
   /* send a completion message to the device's file descriptor */
   write (priv->fds[1], &message, sizeof (message));
-  write (priv->fds[1], &itransfer, sizeof (itransfer));
-  write (priv->fds[1], &result, sizeof (IOReturn));
-  write (priv->fds[1], &size, sizeof (size));
 }
 
 static int darwin_transfer_status (struct usbi_transfer *itransfer, kern_return_t result) {
